@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Gate Ad Skipper</string>
+    <string name="service_label">Gate Ad Skipper</string>
+    <string name="service_description">Watches only the MyGate app and closes the full-screen ad that opens after you approve or deny a visitor. It reads MyGate\'s screen to find the ad and its close button. It does not read other apps and sends nothing off the phone.</string>
+</resources>
