@@ -17,15 +17,17 @@ import java.util.Set;
  * Closes MyGate's full-screen ad. A screen counts as an ad when:
  *  1. it is a known ad-SDK activity (AdMob / Ad Manager, Meta, etc.), or
  *  2. the user marked its class as an ad in the app, or
- *  3. it opens within ARM_WINDOW_MS of tapping Approve/Deny and has ad markers ("Ad", "Sponsored", a close/skip button id).
+ *  3. it shows up within ARM_WINDOW_MS of the Approve/Deny screen and is MyGate's "Entry approved for ..." screen
+ *     (with the ad card and "Upgrade to Premium" upsell), or has ad markers ("Ad", "Sponsored", ad view ids).
  * To close it, the service taps a close/skip button or presses Back, and retries while a countdown runs.
  */
 public class AdSkipService extends AccessibilityService {
     static final String TARGET_PACKAGE = "com.mygate.user";
 
-    private static final long ARM_WINDOW_MS = 10_000;
+    private static final long ARM_WINDOW_MS = 20_000;
     private static final long DISMISS_COOLDOWN_MS = 1_200;
-    private static final long CONTENT_CHECK_INTERVAL_MS = 400;
+    private static final long CONTENT_CHECK_INTERVAL_MS = 300;
+    private static final long IDLE_CHECK_INTERVAL_MS = 1_000;
     private static final long[] RETRY_DELAYS_MS = {900, 2_000, 3_500, 5_500};
     private static final int MAX_NODES = 600;
 
@@ -43,10 +45,18 @@ public class AdSkipService extends AccessibilityService {
             "com.vungle.warren.AdActivity",
             "com.mbridge.msdk.activity.MBCommonActivity"));
 
-    /** Button labels that mean the user just answered a gate request. */
+    /** Button labels on the gate request screen ("Approve Entry", "Deny Entry", ...). */
     private static final String[] ANSWER_WORDS = {
-            "approve", "approved", "allow", "deny", "denied", "reject", "decline",
+            "approve", "allow", "deny", "reject", "decline",
             "accept", "let in", "leave at gate", "wait at gate", "collect at gate", "send in"};
+
+    /**
+     * Text on MyGate's post-decision screen, which is where the ad sits
+     * ("Entry approved for <name>", the ad card, "Upgrade to Premium to enjoy ... ad-free experience").
+     */
+    private static final String[] RESULT_SCREEN_TEXTS = {
+            "entry approved for", "entry denied for", "entry rejected for", "entry declined for",
+            "entry allowed for", "upgrade to premium to enjoy", "ad-free experience"};
 
     /** Exact (case-insensitive) texts that label an ad. */
     private static final Set<String> AD_LABELS = new HashSet<>(Arrays.asList(
@@ -79,7 +89,7 @@ public class AdSkipService extends AccessibilityService {
                 String label = eventLabel(event);
                 if (containsAny(label, ANSWER_WORDS)) {
                     armedUntil = now + ARM_WINDOW_MS;
-                    Store.addLog(this, currentClass, "tapped: " + label, "armed for 10 s");
+                    Store.addLog(this, currentClass, "tapped: " + label, "watching for the ad");
                 }
                 break;
 
@@ -88,62 +98,81 @@ public class AdSkipService extends AccessibilityService {
                 currentClass = cls;
                 if (!cls.equals(dismissTarget)) dismissTarget = null;
                 AccessibilityNodeInfo root = getRootInActiveWindow();
-                String reason = adReason(cls, root, now);
-                Store.addLog(this, cls, summarize(root), reason == null ? "" : "AD: " + reason);
-                if (reason != null) dismiss(cls, root);
+                String reason = adReason(cls, root, now, false);
+                if (reason != null) dismiss(cls, root, reason);
+                else Store.addLog(this, cls, summarize(root), "");
                 break;
 
             case AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED:
-                // The ad can finish loading after the screen opens, so recheck while armed.
-                if (now > armedUntil || now - lastContentCheck < CONTENT_CHECK_INTERVAL_MS) break;
+                // The request screen and the ad are often drawn after the window opens (or swapped in place),
+                // so recheck on content changes: often while armed, occasionally otherwise.
+                long interval = now <= armedUntil ? CONTENT_CHECK_INTERVAL_MS : IDLE_CHECK_INTERVAL_MS;
+                if (now - lastContentCheck < interval) break;
                 lastContentCheck = now;
                 AccessibilityNodeInfo r = getRootInActiveWindow();
-                if (adReason(currentClass, r, now) != null) dismiss(currentClass, r);
+                String why = adReason(currentClass, r, now, false);
+                if (why != null) dismiss(currentClass, r, why);
                 break;
         }
     }
 
-    /** Why this screen is an ad, or null if it isn't. */
-    private String adReason(String cls, AccessibilityNodeInfo root, long now) {
+    /**
+     * Why this screen is an ad, or null if it isn't. Seeing the approve/deny screen arms the watch window,
+     * because MyGate swaps it for the ad screen after you answer. {@code retry} checks without re-arming.
+     */
+    private String adReason(String cls, AccessibilityNodeInfo root, long now, boolean retry) {
         if (cls != null && KNOWN_AD_ACTIVITIES.contains(cls)) return "known ad SDK screen";
-        if (cls != null && Store.blockedClasses(this).contains(cls)) return "on your block list";
-        if (now > armedUntil || root == null) return null;
+        if (root == null || !isMyGate(root)) return null;
         Scan s = scan(root);
-        // Don't close the approve/deny screen itself.
-        if (s.hasAnswerButton) return null;
+        // Never close the approve/deny screen, even if its class is on the block list.
+        if (s.hasAnswerButton) {
+            if (!retry) armedUntil = now + ARM_WINDOW_MS;
+            return null;
+        }
+        if (cls != null && Store.blockedClasses(this).contains(cls)) return "on your block list";
+        if (!retry && now > armedUntil) return null;
+        if (s.isResultScreen) return "entry approved/denied screen with ad";
         if (s.hasAdLabel) return "labelled as an ad after approve/deny";
         if (s.hasAdId) return "ad view after approve/deny";
         return null;
     }
 
-    private void dismiss(String cls, AccessibilityNodeInfo root) {
+    private void dismiss(String cls, AccessibilityNodeInfo root, String reason) {
         long now = SystemClock.uptimeMillis();
         if (now - lastDismissAt < DISMISS_COOLDOWN_MS) return;
+        Store.addLog(this, cls, summarize(root), "AD: " + reason);
         lastDismissAt = now;
         armedUntil = 0;
         dismissTarget = cls;
         Store.incrementSkipped(this);
         closeOnce(root);
-        // Some ads block Back or hide the close button until a countdown ends, so try again until the screen changes.
+        // If the first tap/Back didn't work (countdown, slow animation), try again, but only while
+        // MyGate is still in front and still showing the ad, so Back never lands on another app.
         for (long delay : RETRY_DELAYS_MS) {
             handler.postDelayed(() -> {
-                if (dismissTarget != null && dismissTarget.equals(currentClass)) {
-                    closeOnce(getRootInActiveWindow());
-                }
+                if (dismissTarget == null || !dismissTarget.equals(currentClass)) return;
+                AccessibilityNodeInfo r = getRootInActiveWindow();
+                if (adReason(currentClass, r, SystemClock.uptimeMillis(), true) != null) closeOnce(r);
+                else dismissTarget = null;
             }, delay);
         }
     }
 
     private void closeOnce(AccessibilityNodeInfo root) {
-        AccessibilityNodeInfo close = root == null ? null : scan(root).closeButton;
+        if (root == null || !isMyGate(root)) return;
+        AccessibilityNodeInfo close = scan(root).closeButton;
         if (close != null && clickSelfOrParent(close)) return;
         performGlobalAction(GLOBAL_ACTION_BACK);
+    }
+
+    private static boolean isMyGate(AccessibilityNodeInfo root) {
+        return root.getPackageName() != null && TARGET_PACKAGE.contentEquals(root.getPackageName());
     }
 
     // ---- node scanning ----
 
     private static final class Scan {
-        boolean hasAdLabel, hasAdId, hasAnswerButton;
+        boolean hasAdLabel, hasAdId, hasAnswerButton, isResultScreen;
         AccessibilityNodeInfo closeButton;
     }
 
@@ -161,6 +190,7 @@ public class AdSkipService extends AccessibilityService {
 
             if (AD_LABELS.contains(text) || AD_LABELS.contains(desc)) s.hasAdLabel = true;
             if (containsAny(id, AD_ID_PARTS)) s.hasAdId = true;
+            if (containsAny(text, RESULT_SCREEN_TEXTS) || containsAny(desc, RESULT_SCREEN_TEXTS)) s.isResultScreen = true;
             if (n.isVisibleToUser() && (startsWithAny(text, ANSWER_WORDS) || startsWithAny(desc, ANSWER_WORDS))) {
                 s.hasAnswerButton = true;
             }

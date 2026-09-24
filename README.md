@@ -7,7 +7,7 @@ An Android **Accessibility Service** that only receives events from MyGate. When
 
 1. it's a known ad-SDK screen (Google AdMob/Ad Manager `AdActivity`, Meta, AppLovin, InMobi, …), **or**
 2. you marked that screen as an ad in the app ("learn mode"), **or**
-3. it opens within 10 s of you tapping Approve/Deny/Leave at gate/etc. **and** it shows an "Ad"/"Sponsored" label or ad view ids. The approve/deny screen itself is never closed.
+3. it appears within 20 s of the Approve/Deny screen **and** it is MyGate's "Entry approved for …" screen (the one with the ad card and the "Upgrade to Premium … ad-free experience" banner), or it shows an "Ad"/"Sponsored" label or ad view ids. A screen with Approve/Deny buttons is never closed.
 
 To close the ad it taps a Close/Skip/× button if it finds one. Otherwise it presses Back. It retries for about 5 s in case the ad has a countdown.
 
