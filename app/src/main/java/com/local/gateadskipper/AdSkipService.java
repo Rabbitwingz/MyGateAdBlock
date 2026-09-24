@@ -1,6 +1,12 @@
 package com.local.gateadskipper;
 
 import android.accessibilityservice.AccessibilityService;
+import android.app.KeyguardManager;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -28,7 +34,13 @@ public class AdSkipService extends AccessibilityService {
     private static final long DISMISS_COOLDOWN_MS = 1_200;
     private static final long CONTENT_CHECK_INTERVAL_MS = 300;
     private static final long IDLE_CHECK_INTERVAL_MS = 1_000;
-    private static final long[] RETRY_DELAYS_MS = {900, 2_000, 3_500, 5_500};
+    private static final long[] RETRY_DELAYS_MS = {450, 1_000, 1_800, 3_000, 4_500};
+    private static final long[] UNLOCK_CHECK_DELAYS_MS = {300, 800, 1_500, 2_500};
+    /** How long after closing an ad (phone unlocked) we still leave MyGate's home screen if it pops up. */
+    private static final long LEAVE_WAIT_UNLOCKED_MS = 8_000;
+    /** Same, if the ad was closed on the lock screen: we wait for the next unlock, up to this long. */
+    private static final long LEAVE_WAIT_LOCKED_MS = 30 * 60_000;
+    private static final long LEAVE_GRACE_MS = 400;
     private static final int MAX_NODES = 600;
 
     static final Set<String> KNOWN_AD_ACTIVITIES = new HashSet<>(Arrays.asList(
@@ -78,6 +90,34 @@ public class AdSkipService extends AccessibilityService {
     /** Class of the screen we are currently trying to close, or null. */
     private String dismissTarget;
 
+    /**
+     * Closing the ad screen makes MyGate open its home screen. Until this time we leave MyGate as soon as it shows up
+     * (unlocked); if the ad was closed on the lock screen, we instead wait for the next unlock.
+     */
+    private long leaveMyGateUntil;
+    private boolean leaveOnUnlock;
+    /** Clicks before this time are our own taps, not the user's. */
+    private long ownClickUntil;
+
+    private final BroadcastReceiver unlockReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!leaveOnUnlock) return;
+            // MyGate's home screen was waiting behind the lock screen. Give it a moment to become the active window.
+            for (long delay : UNLOCK_CHECK_DELAYS_MS) handler.postDelayed(() -> maybeLeaveMyGate(), delay);
+            // If MyGate isn't in front shortly after unlocking, forget it, so opening MyGate later is not affected.
+            handler.postDelayed(() -> { leaveOnUnlock = false; leaveMyGateUntil = 0; }, 3_000);
+        }
+    };
+
+    @Override
+    protected void onServiceConnected() {
+        super.onServiceConnected();
+        IntentFilter filter = new IntentFilter(Intent.ACTION_USER_PRESENT);
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(unlockReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        else registerReceiver(unlockReceiver, filter);
+    }
+
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         if (event.getPackageName() == null || !TARGET_PACKAGE.contentEquals(event.getPackageName())) return;
@@ -86,6 +126,10 @@ public class AdSkipService extends AccessibilityService {
         long now = SystemClock.uptimeMillis();
         switch (event.getEventType()) {
             case AccessibilityEvent.TYPE_VIEW_CLICKED:
+                if (now < ownClickUntil) break;
+                // The user is using MyGate themselves, so don't leave it on them.
+                leaveMyGateUntil = 0;
+                leaveOnUnlock = false;
                 String label = eventLabel(event);
                 if (containsAny(label, ANSWER_WORDS)) {
                     armedUntil = now + ARM_WINDOW_MS;
@@ -100,7 +144,10 @@ public class AdSkipService extends AccessibilityService {
                 AccessibilityNodeInfo root = getRootInActiveWindow();
                 String reason = adReason(cls, root, now, false);
                 if (reason != null) dismiss(cls, root, reason);
-                else Store.addLog(this, cls, summarize(root), "");
+                else {
+                    Store.addLog(this, cls, summarize(root), "");
+                    maybeLeaveMyGate();
+                }
                 break;
 
             case AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED:
@@ -112,8 +159,35 @@ public class AdSkipService extends AccessibilityService {
                 AccessibilityNodeInfo r = getRootInActiveWindow();
                 String why = adReason(currentClass, r, now, false);
                 if (why != null) dismiss(currentClass, r, why);
+                else maybeLeaveMyGate();
                 break;
         }
+    }
+
+    /** After we closed an ad, MyGate pops its home screen up; send the user back to where they were. */
+    private void maybeLeaveMyGate() {
+        long now = SystemClock.uptimeMillis();
+        if (now > leaveMyGateUntil || isLocked()) return;
+        if (now - lastDismissAt < LEAVE_GRACE_MS) return; // still closing the ad itself
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null || !isMyGate(root)) return;
+        Scan s = scan(root);
+        if (s.hasAnswerButton || s.isResultScreen) return; // a new visitor request, or the ad itself
+
+        leaveMyGateUntil = 0;
+        leaveOnUnlock = false;
+        Store.addLog(this, currentClass, "", "left MyGate (it opened its home screen after the ad)");
+        performGlobalAction(GLOBAL_ACTION_BACK);
+        // Back may only close a popup or show "press back again to exit"; go Home if MyGate is still in front.
+        handler.postDelayed(() -> {
+            AccessibilityNodeInfo r = getRootInActiveWindow();
+            if (r != null && isMyGate(r) && !scan(r).hasAnswerButton) performGlobalAction(GLOBAL_ACTION_HOME);
+        }, 700);
+    }
+
+    private boolean isLocked() {
+        KeyguardManager km = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        return km != null && km.isKeyguardLocked();
     }
 
     /**
@@ -145,23 +219,39 @@ public class AdSkipService extends AccessibilityService {
         armedUntil = 0;
         dismissTarget = cls;
         Store.incrementSkipped(this);
-        closeOnce(root);
-        // If the first tap/Back didn't work (countdown, slow animation), try again, but only while
+        if (isLocked()) {
+            leaveOnUnlock = true;
+            leaveMyGateUntil = now + LEAVE_WAIT_LOCKED_MS;
+        } else {
+            leaveMyGateUntil = now + LEAVE_WAIT_UNLOCKED_MS;
+        }
+        // Back first: it may close the ad without MyGate's X opening the home screen. The X is the fallback.
+        closeOnce(cls, root, false);
+        // If that didn't work (countdown, slow animation), try again, but only while
         // MyGate is still in front and still showing the ad, so Back never lands on another app.
         for (long delay : RETRY_DELAYS_MS) {
             handler.postDelayed(() -> {
                 if (dismissTarget == null || !dismissTarget.equals(currentClass)) return;
                 AccessibilityNodeInfo r = getRootInActiveWindow();
-                if (adReason(currentClass, r, SystemClock.uptimeMillis(), true) != null) closeOnce(r);
+                if (adReason(currentClass, r, SystemClock.uptimeMillis(), true) != null) closeOnce(currentClass, r, true);
                 else dismissTarget = null;
             }, delay);
         }
     }
 
-    private void closeOnce(AccessibilityNodeInfo root) {
+    private void closeOnce(String cls, AccessibilityNodeInfo root, boolean preferCloseButton) {
         if (root == null || !isMyGate(root)) return;
-        AccessibilityNodeInfo close = scan(root).closeButton;
-        if (close != null && clickSelfOrParent(close)) return;
+        if (preferCloseButton) {
+            AccessibilityNodeInfo close = scan(root).closeButton;
+            if (close != null) {
+                ownClickUntil = SystemClock.uptimeMillis() + 1_500;
+                if (clickSelfOrParent(close)) {
+                    Store.addLog(this, cls, "", "tapped the ad screen's close button");
+                    return;
+                }
+            }
+        }
+        Store.addLog(this, cls, "", "pressed Back");
         performGlobalAction(GLOBAL_ACTION_BACK);
     }
 
@@ -280,6 +370,11 @@ public class AdSkipService extends AccessibilityService {
     @Override
     public void onDestroy() {
         handler.removeCallbacksAndMessages(null);
+        try {
+            unregisterReceiver(unlockReceiver);
+        } catch (IllegalArgumentException ignored) {
+            // never registered (service destroyed before it connected)
+        }
         super.onDestroy();
     }
 }
